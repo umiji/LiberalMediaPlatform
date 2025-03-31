@@ -4,7 +4,7 @@ CSVからデータを読み込み、アクティブなフィード情報を提�
 """
 from typing import List, Dict, Any, Optional, Callable, Tuple
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import importlib
 import pandas as pd
 from loguru import logger
@@ -12,8 +12,20 @@ import os
 import sys
 import importlib.util
 import csv
+from pydantic import BaseModel, HttpUrl
 
-from .base_collector import NewsItem
+
+class NewsItem(BaseModel):
+    """ニュース記事モデル"""
+    media_id: int
+    title: str
+    url: HttpUrl
+    content: str  # HTML形式の記事内容
+    publish_date: Optional[datetime] = None
+    category_id: Optional[int] = None
+    topic_id: Optional[int] = None
+    author: Optional[str] = None
+    source_id: Optional[int] = None
 
 
 class BaseCollectorV2:
@@ -190,12 +202,12 @@ class BaseCollectorV2:
             logger.error(f"Error loading collector module {script_name}: {e}")
             return None
 
-    def get_collector_function(self, module: Any, function_name: str = 'get_news') -> Optional[Any]:
+    def get_collector_function(self, module: Any, function_name: str = 'main') -> Optional[Any]:
         """コレクター関数を取得する
 
         Args:
             module (Any): コレクターモジュール
-            function_name (str, optional): 関数名. Defaults to 'get_news'.
+            function_name (str, optional): 関数名. Defaults to 'main'.
 
         Returns:
             Optional[Any]: コレクター関数
@@ -203,6 +215,10 @@ class BaseCollectorV2:
         try:
             if hasattr(module, function_name):
                 return getattr(module, function_name)
+            elif function_name == 'main' and hasattr(module, 'get_news'):
+                # 後方互換性のため、main関数がなければget_news関数を試す
+                logger.info(f"Module does not have 'main' function, using 'get_news' instead")
+                return getattr(module, 'get_news')
             else:
                 logger.error(f"Function {function_name} not found in module")
                 return None
@@ -240,37 +256,66 @@ class BaseCollectorV2:
         results = []
         all_items = []  # 全コレクターから得られたアイテムを格納するリスト
         
+        # スクリプト名ごとにフィードをグループ化
+        script_feeds = {}
         for feed in feeds:
+            script_name = feed.get('script_file_name')
+            if not script_name:
+                logger.error(f"Script name not found in feed info: {feed}")
+                continue
+            
+            if script_name not in script_feeds:
+                script_feeds[script_name] = []
+            script_feeds[script_name].append(feed)
+        
+        # 各スクリプトに対してコレクターを実行
+        for script_name, script_specific_feeds in script_feeds.items():
             try:
-                # スクリプト名を取得
-                script_name = feed.get('script_file_name')
-                if not script_name:
-                    logger.error(f"Script name not found in feed info: {feed}")
-                    continue
-                
                 # コレクターモジュールを読み込む
                 module = self.load_collector_module(script_name)
                 if not module:
                     continue
                 
-                # コレクター関数を取得
+                # コレクター関数を取得（デフォルトでmain関数）
                 collector_func = self.get_collector_function(module)
                 if not collector_func:
                     continue
                 
-                # コレクターを実行
-                result = await self.execute_collector(feed, collector_func)
-                results.append(result)
+                # スクリプト名から関数名を判断
+                function_name = 'main' if hasattr(module, 'main') else 'get_news'
                 
-                # 結果からアイテムを取得して統合リストに追加
-                if isinstance(result, dict) and 'items' in result and result['items']:
-                    all_items.extend(result['items'])
+                # コレクターを実行（すべてのフィードを一度に渡す）
+                if function_name == 'main':
+                    # main関数は複数のフィードを一度に処理
+                    logger.info(f"Executing collector {script_name}.{function_name} with {len(script_specific_feeds)} feeds")
+                    script_results = await collector_func(script_specific_feeds)
+                    if isinstance(script_results, list):
+                        results.extend(script_results)
+                        # 結果からアイテムを取得して統合リストに追加
+                        for result in script_results:
+                            if isinstance(result, dict) and 'items' in result and result['items']:
+                                all_items.extend(result['items'])
+                    else:
+                        logger.warning(f"Unexpected result type from {script_name}.{function_name}: {type(script_results)}")
+                else:
+                    # get_news関数は1つのフィードずつ処理
+                    for feed in script_specific_feeds:
+                        try:
+                            result = await self.execute_collector(feed, collector_func)
+                            results.append(result)
+                            
+                            # 結果からアイテムを取得して統合リストに追加
+                            if isinstance(result, dict) and 'items' in result and result['items']:
+                                all_items.extend(result['items'])
+                        except Exception as e:
+                            logger.error(f"Error processing feed {feed}: {e}")
+                            results.append({'error': str(e)})
                 
             except Exception as e:
-                logger.error(f"Error processing feed {feed}: {e}")
-                results.append({'error': str(e)})
+                logger.error(f"Error processing script {script_name}: {e}")
+                results.append({'script_name': script_name, 'error': str(e)})
         
-        logger.info(f"Executed {len(results)} collectors")
+        logger.info(f"Executed collectors for {len(script_feeds)} scripts")
         
         # 統合CSVファイルに保存
         if all_items:
@@ -284,6 +329,11 @@ class BaseCollectorV2:
                 file_name = now.strftime('%m%d%H%M_integrated_news.csv')
                 output_file = output_dir / file_name
                 
+                # 日本時間（JST）のタイムゾーンを設定
+                jst = timezone(timedelta(hours=9))
+                now_jst = datetime.now(jst)
+                timestamp_jst = now_jst.strftime("%Y-%m-%d %H:%M:%S %Z")
+                
                 # CSVファイルに書き込む
                 import csv
                 import pandas as pd
@@ -292,6 +342,7 @@ class BaseCollectorV2:
                 df = pd.DataFrame([{
                     'id': '',
                     'media_id': item.media_id,
+                    'source_id': item.source_id if item.source_id is not None else "",
                     'title': item.title,
                     'url': item.url,
                     'content': item.content,
@@ -299,7 +350,7 @@ class BaseCollectorV2:
                     'category_id': item.category_id if item.category_id is not None else "",
                     'topic_id': item.topic_id if item.topic_id is not None else "",
                     'author': item.author if item.author else "",
-                    'collected_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                    'collected_at': timestamp_jst  # タイムゾーン情報を含む形式に変更
                 } for item in all_items])
                 
                 # CSVファイルに保存
