@@ -4,12 +4,14 @@ CSVからデータを読み込み、アクティブなフィード情報を提�
 """
 from typing import List, Dict, Any, Optional, Callable, Tuple
 from pathlib import Path
+from datetime import datetime
 import importlib
 import pandas as pd
 from loguru import logger
 import os
 import sys
 import importlib.util
+import csv
 
 from .base_collector import NewsItem
 
@@ -236,6 +238,8 @@ class BaseCollectorV2:
             List[Dict[str, Any]]: 実行結果のリスト
         """
         results = []
+        all_items = []  # 全コレクターから得られたアイテムを格納するリスト
+        
         for feed in feeds:
             try:
                 # スクリプト名を取得
@@ -258,9 +262,67 @@ class BaseCollectorV2:
                 result = await self.execute_collector(feed, collector_func)
                 results.append(result)
                 
+                # 結果からアイテムを取得して統合リストに追加
+                if isinstance(result, dict) and 'items' in result and result['items']:
+                    all_items.extend(result['items'])
+                
             except Exception as e:
                 logger.error(f"Error processing feed {feed}: {e}")
                 results.append({'error': str(e)})
         
         logger.info(f"Executed {len(results)} collectors")
+        
+        # 統合CSVファイルに保存
+        if all_items:
+            try:
+                # 出力先ディレクトリを設定
+                output_dir = Path('tests/test_news_ingestion_part2/export_data')
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # 現在の日時を取得してファイル名を生成
+                now = datetime.now()
+                file_name = now.strftime('%m%d%H%M_integrated_news.csv')
+                output_file = output_dir / file_name
+                
+                # CSVファイルに書き込む
+                import csv
+                import pandas as pd
+                
+                # 指定されたカラム形式でDataFrameを作成
+                df = pd.DataFrame([{
+                    'id': '',
+                    'media_id': item.media_id,
+                    'title': item.title,
+                    'url': item.url,
+                    'content': item.content,
+                    'publish_date': item.publish_date.strftime("%Y-%m-%d %H:%M:%S") if item.publish_date else "",
+                    'category_id': item.category_id if item.category_id is not None else "",
+                    'topic_id': item.topic_id if item.topic_id is not None else "",
+                    'author': item.author if item.author else "",
+                    'collected_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                } for item in all_items])
+                
+                # CSVファイルに保存
+                df.to_csv(
+                    output_file,
+                    index=False,
+                    encoding='utf-8',  # UTF-8エンコーディングを使用
+                    quoting=csv.QUOTE_ALL,
+                    errors='replace'  # エンコードできない文字は置換
+                )
+                
+                logger.info(f"Integrated {len(all_items)} news items from {len(results)} collectors into {output_file}")
+                
+                # 統合ファイルの情報を返すための結果オブジェクトを作成
+                integrated_result = {
+                    'integrated_output_file': str(output_file),
+                    'total_items': len(all_items),
+                    'collector_count': len(results)
+                }
+                
+                # 統合結果をresultsに追加
+                results.append(integrated_result)
+            except Exception as e:
+                logger.error(f"Error saving integrated results to CSV: {e}")
+        
         return results 
